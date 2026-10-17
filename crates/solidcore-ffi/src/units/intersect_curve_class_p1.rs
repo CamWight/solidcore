@@ -16,7 +16,9 @@
 //! (an `SmBSplineSurface`), `3 P[3]` (an `SmPoint3d`), `4` vertex, `5 c` (an edge on pool curve
 //! `c`, `-1` none), `6 s` (a face on pool surface `s`, `-1` none), `7` loop stand-in, `8` other
 //! stand-in (used for the topology intersector and other-classification pointers, which are
-//! only stored).
+//! only stored). The vertex, edge and face stand-ins have no uses and the system zone
+//! tolerance; an edge spans the natural interval of its curve, a face the natural UV domain of
+//! its surface.
 //!
 //! | code | op (`op t ...`)                              | upstream                                    | outputs after the status |
 //! |------|----------------------------------------------|---------------------------------------------|--------------------------|
@@ -55,9 +57,9 @@
 //! | 45   | `CP[3] EP[3] t0 t1 n (s uvc)*n count`        | `sm_GetCCISurfaceGaps`                      | `g1 g2 g3 n (u v)*n`     |
 //! | 46   | `c n touch*n`                                | `SmTouchData::GetConnectedTouches` (with and without list) | `cnt cnt2 touch*cnt` |
 //! | 47   | `n touch*n`                                  | `SmTouchData::GetWindingCount`              | `count orient`           |
-//! | 48   | `e P[3] (s u v)*2 param`                     | `sm_SetXSectEdgeThroughPoint`               | `param dev modified`     |
-//! | 49   | `e`                                          | `sm_GetCCIGeometry`                         | `n_surfaces count`       |
-//! | 50   | `f P[3] tol`                                 | `sm_ComputeFacePointClass`                  | `class`                  |
+//! | 48   | `e P[3] (s u v)*2 param set_ivl min max`     | `sm_SetXSectEdgeThroughPoint` (`SetInterval(min, max)` first when `set_ivl`) | `param dev modified curve` |
+//! | 49   | `e`                                          | `sm_GetCCIGeometry`                         | `emate n count (surface edgeuse uv_curve)*n` (edge use `-1` none, `-2` some) |
+//! | 50   | `f P[3] tol`                                 | `sm_ComputeFacePointClass`                  | `point_class`            |
 //!
 //! A touch is `connected_to loop_dir loop_index param pt_index pt_classify` (ids or `-1`).
 //! A curve record is `min max n m (status [P[3]])*7`: the natural interval, the NURB's highest
@@ -683,6 +685,9 @@ pub fn validate(input: &[f64]) -> Result<(), FfiError> {
                     rd.finite()?;
                     rd.finite()?;
                 }
+                rd.finite()?;
+                rd.flag()?;
+                rd.finite()?;
                 rd.finite()?;
             }
             op::FACE_POINT_CLASS => {

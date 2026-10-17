@@ -13,9 +13,15 @@
 //! its `SmStatus` (`InvalidInput` 1007, `-1` for one upstream cannot return); an `Unported`
 //! error anywhere defers the case.
 //!
-//! Deferred cases: ops that reach topology (`ComputePointParameters` on vertices, edges and
-//! faces, `sm_SetXSectEdgeThroughPoint`, `sm_GetCCIGeometry`, `sm_ComputeFacePointClass`),
-//! surface point solves (`ComputePointParameters` on surfaces, `sm_GetCCISurfaceGaps` with
+//! The vertex, edge and face stand-ins have no uses and the system zone tolerance (the
+//! pool's [`ClassGeometry::topology_zone_tol_3d`]); the Rust side keeps the edges and faces
+//! in a [`Brep`] (an edge on its pool curve's natural interval, sharing the pool curve as
+//! upstream does, a face on its pool surface's natural UV domain), on which
+//! `sm_SetXSectEdgeThroughPoint`, `sm_GetCCIGeometry` and `sm_ComputeFacePointClass` run;
+//! [`TOPOLOGY_CASES`] fixed-seed scripts exercise them.
+//!
+//! Deferred cases: ops that reach other topology (`ComputePointParameters` on vertices,
+//! edges and faces), surface point solves (`ComputePointParameters` on surfaces, `sm_GetCCISurfaceGaps` with
 //! surfaces), `SmTol::MapTo2d` for a curve of dimension other than 2 or 3 on a surface
 //! (`SmSurface::DropPoint`) and an `SmCrvOnSurf` over a plane. Generated scripts are filtered by the shim's
 //! run-time checks (scripts it rejects as undefined upstream are dropped).
@@ -27,13 +33,15 @@ use solidcore::curve::curve::p2::{Curve, CurveKind};
 use solidcore::curve::ellipse::{Ellipse, EllipseOptions};
 use solidcore::curve::hermite_curve::HermiteCurve;
 use solidcore::curve::line::{BoundedLineOptions, Line};
+use solidcore::error::EntityRef;
 use solidcore::geom::extent1d::Extent1d;
+use solidcore::geom::extent2d::Extent2d;
 use solidcore::geom::solution_array::{ObjectKind, Solution, SolutionArray, SolutionObject, SolutionType};
-use solidcore::geom::tol::{zone_tol3d, ScaledZero};
+use solidcore::geom::tol::{zone_tol3d, ScaledZero, ZONE_TOL_3D};
 use solidcore::geom::vector3d::Vec3;
 use solidcore::intersect::curve_class::{
     self as cc_mod, ApplyPointSolutionInput, CrvDirOnFaceType, CurveClassification,
-    CurveInterval, TouchData, CURVE_CLASSIFICATION_TYPE_STRING,
+    CurveInterval, TopologyHandles, TouchData, CURVE_CLASSIFICATION_TYPE_STRING,
 };
 use solidcore::intersect::point_class::{
     ClassGeometry, ClassObject, ClassObjectKind, PointClassType, PointClassification,
@@ -48,6 +56,7 @@ use solidcore::nurbs::srf_basic::Surface as NurbSurface;
 use solidcore::surface::plane::Plane;
 use solidcore::surface::surface::Surface;
 use solidcore::surface::volume::Volume;
+use solidcore::topology::{Brep, Edge, EdgeId, EdgeuseId, Face, FaceId};
 use solidcore::SolidError;
 use solidcore_ffi::units::intersect_curve_class_p1::{self as ffi, kind, op};
 
@@ -272,7 +281,17 @@ enum OpIn {
     },
     TouchConnected { t: usize, c: Option<usize>, touches: Vec<TouchIn> },
     TouchWinding { t: usize, touches: Vec<TouchIn> },
-    EdgeThrough { t: usize, e: Option<usize>, p: [f64; 3], srf: [Option<usize>; 2], uv: [[f64; 2]; 2], prm: f64 },
+    EdgeThrough {
+        t: usize,
+        e: Option<usize>,
+        p: [f64; 3],
+        srf: [Option<usize>; 2],
+        uv: [[f64; 2]; 2],
+        prm: f64,
+        /// `SetInterval(min, max)` of the edge first.
+        #[serde(default)]
+        ivl: Option<[f64; 2]>,
+    },
     CciGeometry { t: usize, e: Option<usize> },
     FacePointClass { t: usize, f: Option<usize>, p: [f64; 3], tol: f64 },
 }
@@ -595,13 +614,17 @@ fn cpp_input(s: &Script) -> Vec<f64> {
                 touches_block(&mut v, touches);
             }
             OpIn::TouchWinding { touches, .. } => touches_block(&mut v, touches),
-            OpIn::EdgeThrough { e, p, srf, uv, prm, .. } => {
+            OpIn::EdgeThrough { e, p, srf, uv, prm, ivl, .. } => {
                 v.push(opt_id(*e));
                 v.extend_from_slice(p);
                 for (s, q) in srf.iter().zip(uv) {
                     v.extend([opt_id(*s), q[0], q[1]]);
                 }
                 v.push(*prm);
+                match ivl {
+                    Some([a, bb]) => v.extend([1.0, *a, *bb]),
+                    None => v.extend([0.0, 0.0, 0.0]),
+                }
             }
             OpIn::FacePointClass { f, p, tol, .. } => {
                 v.push(opt_id(*f));
@@ -709,6 +732,15 @@ pub(crate) struct Pool {
     pub(crate) objs: Vec<PoolObj>,
     pub(crate) handles: Vec<H>,
     pub(crate) kinds: Vec<usize>,
+    /// The B-rep holding the edge and face stand-ins (no uses, as the shim's).
+    pub(crate) brep: Brep,
+    /// The B-rep entity of each pool object (edges and faces).
+    pub(crate) topo: Vec<Option<EntityRef>>,
+    /// The pool object an edge's curve or a face's surface is.
+    pub(crate) geometry_of: Vec<Option<usize>>,
+    /// The stored tolerance of the vertex, edge and face stand-ins, when the runner's
+    /// shim gives them one ([`ClassGeometry::topology_zone_tol_3d`]).
+    pub(crate) topo_tol: Option<f64>,
 }
 
 impl ClassGeometry<H> for Pool {
@@ -732,6 +764,27 @@ impl ClassGeometry<H> for Pool {
             Some(PoolObj::Point(p)) => Some(*p),
             _ => None,
         }
+    }
+    fn topology_zone_tol_3d(&self, o: H) -> Option<f64> {
+        match o.1 {
+            ClassObjectKind::Vertex | ClassObjectKind::Edge | ClassObjectKind::Face => self.topo_tol,
+            _ => None,
+        }
+    }
+}
+
+impl TopologyHandles<H> for Pool {
+    fn face_surface(&self, f: FaceId) -> Option<H> {
+        let i = self.topo.iter().position(|t| *t == Some(EntityRef::Face(f)))?;
+        let s = (*self.geometry_of.get(i)?)?;
+        self.handles.get(s).copied()
+    }
+    fn edgeuse(&self, eu: EdgeuseId) -> H {
+        // the stand-ins have no edge uses
+        H(usize::MAX - eu.index() as usize, ClassObjectKind::Edgeuse)
+    }
+    fn uv_trim_curve(&self, eu: EdgeuseId) -> H {
+        H(usize::MAX - eu.index() as usize, ClassObjectKind::Curve)
     }
 }
 
@@ -782,6 +835,23 @@ impl Pool {
             *slot = PoolObj::Curve(c);
         }
     }
+
+    /// The B-rep edge of pool edge `i` and the pool index of its curve.
+    fn edge_of(&self, i: Option<usize>) -> Result<(EdgeId, Option<usize>), HarnessError> {
+        let i = i.ok_or_else(|| harness("no edge"))?;
+        match self.topo.get(i) {
+            Some(Some(EntityRef::Edge(e))) => Ok((*e, self.geometry_of.get(i).copied().flatten())),
+            _ => Err(harness("not an edge")),
+        }
+    }
+
+    /// The pool index of a B-rep entity (`-2` outside the pool, as the shim's ids).
+    fn entity_id(&self, e: Option<EntityRef>) -> f64 {
+        match e {
+            None => -1.0,
+            Some(e) => self.topo.iter().position(|t| *t == Some(e)).map_or(-2.0, |i| i as f64),
+        }
+    }
 }
 
 pub(crate) fn class_kind_of(k: usize) -> ClassObjectKind {
@@ -816,9 +886,50 @@ pub(crate) fn build_pool(objects: &[ObjIn]) -> Result<Pool, HarnessError> {
         objs: Vec::new(),
         handles: Vec::new(),
         kinds: Vec::new(),
+        brep: Brep::new(),
+        topo: Vec::new(),
+        geometry_of: Vec::new(),
+        topo_tol: None,
     };
+    let topo_err = |e: SolidError| harness(format!("stand-in topology: {e}"));
+    let shell = pool.brep.add_shell().map_err(topo_err)?;
+    let anchor = pool.brep.add_vertex(Vec3::new(0.0, 0.0, 0.0)).map_err(topo_err)?;
     for (i, o) in objects.iter().enumerate() {
         let k = obj_kind(o);
+        let (topo, geometry) = match o {
+            ObjIn::Edge(c) => {
+                let curve = pool.curve_at(*c)?.cloned();
+                let interval = curve.as_ref().map_or_else(Extent1d::new, Curve::natural_interval);
+                let e = pool
+                    .brep
+                    .add_edge_record(Edge {
+                        vertices: [anchor, anchor],
+                        edgeuses: Vec::new(),
+                        interval,
+                        tolerance: ZONE_TOL_3D,
+                        curve,
+                    })
+                    .map_err(topo_err)?;
+                (Some(EntityRef::Edge(e)), *c)
+            }
+            ObjIn::Face(sf) => {
+                let surface = pool.surface_at(*sf)?.cloned();
+                let uv_domain = surface.as_ref().map_or_else(Extent2d::new, Surface::natural_uv_domain);
+                let f = pool
+                    .brep
+                    .add_face_record(Face {
+                        surface,
+                        uv_domain,
+                        tolerance: ZONE_TOL_3D,
+                        ..Face::new(shell)
+                    })
+                    .map_err(topo_err)?;
+                (Some(EntityRef::Face(f)), *sf)
+            }
+            _ => (None, None),
+        };
+        pool.topo.push(topo);
+        pool.geometry_of.push(geometry);
         let obj = match o {
             ObjIn::Curve(c) => PoolObj::Curve(build_curve(c)?),
             ObjIn::Plane { o, n } => {
@@ -880,6 +991,25 @@ pub(crate) fn put_pc(o: &mut Vec<f64>, pc: &PointClassification<H>) {
     o.push(f64::from(pc.point_class().code()));
     o.push(id(pc.object()));
     o.push(id(pc.face()));
+    o.push(pc.deviation());
+    o.push(pc.t_param());
+    let uv = pc.uv_param();
+    o.extend([uv.x, uv.y]);
+    let w = pc.uvw_param();
+    o.extend([w.x, w.y, w.z]);
+    o.push(b(pc.are_parameters_set()));
+    o.push(pc.pre_snap_param());
+    o.push(b(pc.sss_point_flag()));
+    let s = pc.sss_point();
+    o.extend([s.x, s.y, s.z]);
+    o.push(pc.src_zone_tol_3d());
+}
+
+/// [`put_pc`] for a classification of the stand-in B-rep.
+fn put_pc_brep(o: &mut Vec<f64>, pool: &Pool, pc: &PointClassification<EntityRef>) {
+    o.push(f64::from(pc.point_class().code()));
+    o.push(pool.entity_id(pc.object()));
+    o.push(pool.entity_id(pc.face()));
     o.push(pc.deviation());
     o.push(pc.t_param());
     let uv = pc.uv_param();
@@ -997,6 +1127,7 @@ fn uvp(q: [f64; 2]) -> Point2 {
 fn rust_run(s: &Script) -> Result<Vec<f64>, Fail> {
     let k = Kernel::default();
     let mut pool = build_pool(&s.objects)?;
+    pool.topo_tol = Some(ZONE_TOL_3D);
     let mut ccs: [CurveClassification<H>; 2] =
         [CurveClassification::new(&k), CurveClassification::new(&k)];
     let mut o: Vec<f64> = Vec::new();
@@ -1468,26 +1599,69 @@ fn rust_run(s: &Script) -> Result<Vec<f64>, Fail> {
                     };
                     o.extend([0.0, w as f64, code]);
                 }
-                OpIn::EdgeThrough { e, p, srf, uv, prm, .. } => {
-                    let h = pool.handle(*e)?.ok_or_else(|| harness("no edge"))?;
-                    let surfaces: Vec<&Surface> = srf
-                        .iter()
-                        .map(|x| pool.surface_at(*x)?.ok_or_else(|| harness("no surface")))
-                        .collect::<Result<_, _>>()?;
-                    let uvs: Vec<Point2> = uv.iter().map(|q| uvp(*q)).collect();
-                    must(cc_mod::set_xsect_edge_through_point(h, v3(*p), &surfaces, &uvs, *prm))?;
-                    return Err(harness("edge through point ported").into());
+                OpIn::EdgeThrough {
+                    e, p, srf, uv, prm, ivl, ..
+                } => {
+                    let (eid, ci) = pool.edge_of(*e)?;
+                    let ci = ci.ok_or_else(|| harness("edge without curve"))?;
+                    // the edge shares the pool curve (upstream points to it)
+                    let curve = pool.curve_at(Some(ci))?.cloned();
+                    let mut brep = core::mem::take(&mut pool.brep);
+                    let edge = brep.edge_mut(eid).map_err(|e| harness(e.to_string()))?;
+                    edge.curve = curve;
+                    if let Some([a, bb]) = ivl {
+                        edge.interval = Extent1d::from_min_max(*a, *bb);
+                    }
+                    let r = {
+                        let surfaces: Vec<&Surface> = srf
+                            .iter()
+                            .map(|x| pool.surface_at(*x)?.ok_or_else(|| harness("no surface")))
+                            .collect::<Result<_, _>>()?;
+                        let uvs: Vec<Point2> = uv.iter().map(|q| uvp(*q)).collect();
+                        cc_mod::set_xsect_edge_through_point(&k, &mut brep, eid, v3(*p), &surfaces, &uvs, *prm)
+                    };
+                    let curve = brep.edge(eid).ok().and_then(|e| e.curve.clone());
+                    pool.brep = brep;
+                    if let Some(c) = curve {
+                        pool.put_curve(ci, c);
+                    }
+                    let r = must(r)?;
+                    o.extend([
+                        if r.success { 0.0 } else { 1001.0 },
+                        r.param,
+                        r.deviation.unwrap_or(-7.0),
+                        b(r.modified_curve),
+                    ]);
+                    put_curve(&mut o, pool.curve_at(Some(ci))?.ok_or_else(|| harness("no curve"))?);
                 }
                 OpIn::CciGeometry { e, .. } => {
-                    let h = pool.handle(*e)?.ok_or_else(|| harness("no edge"))?;
-                    must(cc_mod::get_cci_geometry(&cc, h))?;
-                    return Err(harness("cci geometry ported").into());
+                    let (eid, _) = pool.edge_of(*e)?;
+                    let g = must(cc_mod::get_cci_geometry(&cc, &pool.brep, eid, &pool))?;
+                    o.extend([0.0, id(g.emate), g.surfaces.len() as f64, g.edge_surface_count as f64]);
+                    for ((s, eu), uvc) in g.surfaces.iter().zip(&g.edgeuses).zip(&g.uv_curves) {
+                        o.extend([id(*s), if eu.is_some() { -2.0 } else { -1.0 }, id(*uvc)]);
+                    }
                 }
                 OpIn::FacePointClass { f, p, tol, .. } => {
-                    let h = pool.handle(*f)?.ok_or_else(|| harness("no face"))?;
+                    let fid = match pool.topo.get(f.ok_or_else(|| harness("no face"))?) {
+                        Some(Some(EntityRef::Face(fid))) => *fid,
+                        _ => return Err(harness("not a face").into()),
+                    };
                     let mut pc = PointClassification::new(zone_tol3d(&k, USE_DEFAULT));
-                    must(cc_mod::compute_face_point_class(v3(*p), zone_tol3d(&k, *tol), h, &mut pc))?;
-                    return Err(harness("face point class ported").into());
+                    let r = st(cc_mod::compute_face_point_class(
+                        &k,
+                        &pool.brep,
+                        v3(*p),
+                        zone_tol3d(&k, *tol),
+                        fid,
+                        &mut pc,
+                    ))?;
+                    o.push(match r {
+                        Ok(true) => 0.0,
+                        Ok(false) => 1001.0,
+                        Err(s) => s,
+                    });
+                    put_pc_brep(&mut o, &pool, &pc);
                 }
                 _ => {}
             }
@@ -2251,6 +2425,208 @@ fn gen_script(rng: &mut Rng) -> Script {
 }
 
 /// Whether the shim accepts the script (it rejects what is undefined upstream).
+/// Fixed-seed scripts on the topology stand-ins: `sm_SetXSectEdgeThroughPoint` on an edge
+/// over the curve of a surf/surf setup (its natural interval, a sub-interval or a wider
+/// one; the surfaces' own UV points, a B-spline surface, guesses off the curve),
+/// `sm_GetCCIGeometry` with the classification's surfaces set or not and
+/// `sm_ComputeFacePointClass` for points on, near and off a plane or B-spline face, at
+/// tolerances from tiny to large, at unit, huge and tiny scales.
+pub(crate) const TOPOLOGY_CASES: usize = 400;
+
+fn gen_topology_script(rng: &mut Rng) -> Script {
+    let mut objects = Vec::new();
+    let (ci, s, uv, f) = gen_xsect_setup(rng, &mut objects);
+    let (x, y) = {
+        let d = dir(rng);
+        let e = norm(cross(d, dir(rng)));
+        (d, e)
+    };
+    let o = rp(rng, 5.0);
+    let sz = rng.uniform(1.0, 20.0);
+    let bump = rng.uniform(0.0, 2.0);
+    objects.push(ObjIn::Bsurf(gen_surface(rng, o, x, y, sz, bump)));
+    let bs = objects.len() - 1;
+    objects.push(ObjIn::Edge(Some(ci)));
+    let e = objects.len() - 1;
+    let fs = match rng.below(3) {
+        0 => s[0],
+        1 => s[1],
+        _ => bs,
+    };
+    objects.push(ObjIn::Face(Some(fs)));
+    let fi = objects.len() - 1;
+    let (a, z) = match objects.get(ci) {
+        Some(ObjIn::Curve(CurveIn::Bspline(b))) => {
+            (b.u.first().copied().unwrap_or(0.0), b.u.last().copied().unwrap_or(1.0))
+        }
+        _ => (0.0, 1.0),
+    };
+    let len = z - a;
+    let mut ops = Vec::new();
+    let s1 = match rng.below(6) {
+        0 => None,
+        1 => Some(fs),
+        _ => Some(s[0]),
+    };
+    let s2 = if rng.chance(0.8) { Some(s[1]) } else { None };
+    ops.push(OpIn::SetIntersectData { t: 0, s1, s2, uv2: None, current: true, ti: None });
+    match rng.below(3) {
+        0 => {
+            let mut srf = [Some(s[0]), Some(s[1])];
+            let mut q = uv;
+            if rng.chance(0.15) {
+                srf[1] = Some(bs);
+                if let Some(obj) = objects.get(bs) {
+                    q[1] = surf_uv(rng, obj);
+                }
+            }
+            let ivl = match rng.below(5) {
+                0 | 1 => None,
+                2 => {
+                    let r1 = rng.uniform(0.0, 0.5);
+                    let r2 = rng.uniform(0.5, 1.0);
+                    Some([a + r1 * len, a + r2 * len])
+                }
+                3 => Some([a - 0.1 * len, z + 0.1 * len]),
+                _ => Some([a, a + rng.uniform(0.3, 1.0) * len]),
+            };
+            let prm = match rng.below(4) {
+                0 => a - 0.2 * len,
+                1 => z + 0.2 * len,
+                _ => a + f.clamp(0.0, 1.0) * len + rng.uniform(-0.05, 0.05) * len,
+            };
+            let mut p = match (objects.get(s[0]), objects.get(s[1])) {
+                (Some(ObjIn::Plane { o, n }), _) => {
+                    let pl = Surface::from(Plane::from_normal(v3(*o), v3(*n)));
+                    let r = pl.evaluate_point(uvp(q[0])).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+                    [r.x, r.y, r.z]
+                }
+                _ => [0.0; 3],
+            };
+            if rng.chance(0.25) {
+                // a point on the curve, at the guess or off it
+                let t = a + rng.uniform(0.0, 1.0) * len;
+                let on = build_pool(&objects)
+                    .ok()
+                    .and_then(|pl| pl.curve_at(Some(ci)).ok().flatten().and_then(|c| c.evaluate_point(t).ok()));
+                if let Some(c) = on {
+                    p = [c.x, c.y, c.z];
+                    for (slot, si) in q.iter_mut().zip(srf) {
+                        if let Some(ObjIn::Plane { o, n }) = si.and_then(|i| objects.get(i)) {
+                            *slot = plane_uv(*o, *n, p);
+                        }
+                    }
+                }
+            } else if rng.chance(0.2) {
+                let off = *rng.choose(&[1e-9, 1e-6, 1e-4, 1e-2]).unwrap_or(&1e-6);
+                let d = rp(rng, off);
+                p = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+            }
+            ops.push(OpIn::EdgeThrough { t: 0, e: Some(e), p, srf, uv: q, prm, ivl });
+            if rng.chance(0.5) {
+                ops.push(OpIn::CciGeometry { t: 0, e: Some(e) });
+            }
+        }
+        1 => ops.push(OpIn::CciGeometry { t: rng.below(2) as usize, e: Some(e) }),
+        _ => {
+            let q = match objects.get(fs) {
+                Some(obj @ ObjIn::Bsurf(_)) => surf_uv(rng, obj),
+                _ => [rng.uniform(-3.0, 3.0), rng.uniform(-3.0, 3.0)],
+            };
+            let pool = build_pool(&objects).ok();
+            let on = pool
+                .as_ref()
+                .and_then(|pl| pl.surface_at(Some(fs)).ok().flatten())
+                .and_then(|srf| srf.evaluate_point(uvp(q)).ok())
+                .map_or([0.0; 3], |r| [r.x, r.y, r.z]);
+            let off = *rng.choose(&[0.0, 1e-8, 1e-6, 1e-4, 1e-2, 1.0]).unwrap_or(&0.0);
+            let d = rp(rng, off);
+            let p = [on[0] + d[0], on[1] + d[1], on[2] + d[2]];
+            ops.push(OpIn::FacePointClass { t: 0, f: Some(fi), p, tol: gen_tol(rng) });
+        }
+    }
+    let scale = match rng.below(8) {
+        0 => 1e4,
+        1 => 1e-4,
+        _ => 1.0,
+    };
+    if scale != 1.0 {
+        scale_script(&mut objects, &mut ops, scale);
+    }
+    Script { objects, ops }
+}
+
+/// Scales the geometry, points and tolerances of a topology script by `f` (UV
+/// parameters, curve parameters and intervals are unchanged).
+fn scale_script(objects: &mut [ObjIn], ops: &mut [OpIn], f: f64) {
+    let sc = |p: &mut [f64; 3]| {
+        for c in p.iter_mut() {
+            *c *= f;
+        }
+    };
+    for o in objects.iter_mut() {
+        match o {
+            ObjIn::Curve(CurveIn::Bspline(b)) => {
+                for c in &mut b.cpts {
+                    c[0] *= f;
+                    c[1] *= f;
+                    c[2] *= f;
+                }
+            }
+            ObjIn::Plane { o, .. } => sc(o),
+            ObjIn::Bsurf(s) => {
+                for row in &mut s.net {
+                    for c in row.iter_mut() {
+                        c[0] *= f;
+                        c[1] *= f;
+                        c[2] *= f;
+                    }
+                }
+            }
+            ObjIn::Point(p) => sc(p),
+            _ => {}
+        }
+    }
+    let planes: Vec<bool> = objects.iter().map(|o| matches!(o, ObjIn::Plane { .. })).collect();
+    for op in ops.iter_mut() {
+        match op {
+            OpIn::EdgeThrough { p, srf, uv, .. } => {
+                sc(p);
+                // a plane's UV parameters are lengths
+                for (s, q) in srf.iter().zip(uv.iter_mut()) {
+                    if s.and_then(|i| planes.get(i).copied()).unwrap_or(false) {
+                        q[0] *= f;
+                        q[1] *= f;
+                    }
+                }
+            }
+            OpIn::FacePointClass { p, tol, .. } => {
+                sc(p);
+                if *tol > 0.0 && *tol != USE_DEFAULT {
+                    *tol *= f;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The fixed-seed topology scripts the shim accepts.
+fn topology_cases() -> Vec<(String, Value)> {
+    let mut rng = Rng::new(0x7090_1061);
+    let mut out = Vec::new();
+    let mut tries = 0;
+    while out.len() < TOPOLOGY_CASES && tries < 4 * TOPOLOGY_CASES {
+        tries += 1;
+        let s = gen_topology_script(&mut rng);
+        if ffi::validate(&cpp_input(&s)).is_err() || !shim_accepts(&s) {
+            continue;
+        }
+        out.push((format!("topology_{}", out.len()), json!(s)));
+    }
+    out
+}
+
 fn shim_accepts(s: &Script) -> bool {
     match ffi::run(&cpp_input(s)) {
         Ok(_) => true,
@@ -2371,7 +2747,7 @@ fn edge_cases() -> Vec<(String, Value)> {
         OpIn::Gaps { t: 0, cp: [0.0; 3], ep: [3.0, 4.0, 0.0], sol: [0.0, 0.0], pairs: vec![], count: 0 },
     ];
     out.push(("edge_angles".into(), json!(Script { objects: objs, ops })));
-    // the topology helpers (deferred in the port)
+    // the topology helpers on the stand-ins
     let objs = vec![
         line([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0]),
         ObjIn::Plane { o: [0.0, 0.0, 0.0], n: [0.0, 0.0, 1.0] },
@@ -2389,6 +2765,7 @@ fn edge_cases() -> Vec<(String, Value)> {
                 srf: [Some(1), Some(2)],
                 uv: [[0.5, 0.0], [0.5, 0.0]],
                 prm: 0.4,
+                ivl: None,
             },
         ),
         ("cci_geometry", OpIn::CciGeometry { t: 0, e: Some(3) }),
@@ -2428,7 +2805,7 @@ impl UnitDiff for Runner {
             ..ctx.clone()
         };
         let mut cases = default_cases(self, &ctx)?;
-        for (name, inputs) in edge_cases() {
+        for (name, inputs) in edge_cases().into_iter().chain(topology_cases()) {
             cases.push(Case {
                 unit: self.id().into(),
                 name,
@@ -2470,6 +2847,59 @@ mod tests {
         }
         assert!(total > 250, "{total}");
         assert!(deferred * 3 < total, "{deferred} of {total} deferred");
+    }
+
+    /// The topology scripts reach the edit and failure branches of
+    /// `sm_SetXSectEdgeThroughPoint` and project points both onto and not onto the face's
+    /// surface (a face without loops classifies nothing inside).
+    #[test]
+    fn topology_cases_reach_the_branches() {
+        let k = Kernel::default();
+        let cases = topology_cases();
+        assert_eq!(cases.len(), TOPOLOGY_CASES);
+        let (mut modified, mut unmodified, mut failed, mut face_in, mut face_other, mut cci) = (0, 0, 0, 0, 0, 0);
+        for (_, v) in &cases {
+            let s: Script = serde_json::from_value(v.clone()).unwrap();
+            let mut pool = build_pool(&s.objects).unwrap();
+            for x in &s.ops {
+                match x {
+                    OpIn::EdgeThrough { e, p, srf, uv, prm, ivl, .. } => {
+                        let (eid, _) = pool.edge_of(*e).unwrap();
+                        let mut brep = core::mem::take(&mut pool.brep);
+                        if let Some([a, bb]) = ivl {
+                            brep.edge_mut(eid).unwrap().interval = Extent1d::from_min_max(*a, *bb);
+                        }
+                        let surfaces: Vec<&Surface> =
+                            srf.iter().map(|x| pool.surface_at(*x).unwrap().unwrap()).collect();
+                        let uvs: Vec<Point2> = uv.iter().map(|q| uvp(*q)).collect();
+                        let r = cc_mod::set_xsect_edge_through_point(&k, &mut brep, eid, v3(*p), &surfaces, &uvs, *prm)
+                            .unwrap();
+                        match (r.success, r.modified_curve) {
+                            (true, true) => modified += 1,
+                            (true, false) => unmodified += 1,
+                            _ => failed += 1,
+                        }
+                        pool.brep = brep;
+                    }
+                    OpIn::FacePointClass { f, p, tol, .. } => {
+                        let Some(Some(EntityRef::Face(fid))) = pool.topo.get(f.unwrap()) else { panic!() };
+                        let mut pc = PointClassification::new(zone_tol3d(&k, USE_DEFAULT));
+                        let ok = cc_mod::compute_face_point_class(&k, &pool.brep, v3(*p), zone_tol3d(&k, *tol), *fid, &mut pc);
+                        if matches!(ok, Ok(true)) {
+                            face_in += 1;
+                        } else {
+                            face_other += 1;
+                        }
+                    }
+                    OpIn::CciGeometry { .. } => cci += 1,
+                    _ => {}
+                }
+            }
+        }
+        println!("edge through: {modified} modified, {unmodified} unmodified, {failed} SM_ERR; face: {face_in} projected, {face_other} not; cci {cci}");
+        assert!(modified > 10 && unmodified > 10 && failed > 5, "{modified} {unmodified} {failed}");
+        assert!(face_in > 10 && face_other > 10, "{face_in} {face_other}");
+        assert!(cci > 50, "{cci}");
     }
 }
 
