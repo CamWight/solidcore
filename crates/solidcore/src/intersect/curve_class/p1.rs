@@ -2584,7 +2584,9 @@ mod tests {
         let mut b = Brep::new();
         let shell = b.add_shell().unwrap();
         let v = b.add_vertex(Point3::new(0.0, 0.0, 0.0)).unwrap();
-        let interval = curve.as_ref().map_or_else(Extent1d::new, Curve::natural_interval);
+        let interval = curve
+            .as_ref()
+            .map_or_else(Extent1d::new, Curve::natural_interval);
         let e = b
             .add_edge_record(crate::topology::Edge {
                 vertices: [v, v],
@@ -2622,7 +2624,13 @@ mod tests {
         assert_eq!(g.emate, None);
 
         // a Boolean's classification needs the topology intersector
-        cc.set_intersect_data(Some(s1), Some(s2), None, true, Some(H(9, ClassObjectKind::Other)));
+        cc.set_intersect_data(
+            Some(s1),
+            Some(s2),
+            None,
+            true,
+            Some(H(9, ClassObjectKind::Other)),
+        );
         assert!(matches!(
             get_cci_geometry(&cc, &b, e, &Handles),
             Err(SolidError::Unported { .. })
@@ -2634,20 +2642,25 @@ mod tests {
         let k = Kernel::default();
         let (b, _, f) = stand_in_brep(None);
         let mut pc = PointClassification::new(1e-5);
-        let ok = compute_face_point_class(&k, &b, Point3::new(0.25, 0.5, 1e-7), 1e-5, f, &mut pc).unwrap();
+        let ok = compute_face_point_class(&k, &b, Point3::new(0.25, 0.5, 1e-7), 1e-5, f, &mut pc)
+            .unwrap();
         assert!(ok);
         // a face without loops has nothing inside
         assert_eq!(pc.point_class(), PointClassType::Unknown);
         // nothing near
         let mut pc = PointClassification::new(1e-5);
-        let far = compute_face_point_class(&k, &b, Point3::new(0.25, 0.5, 3.0), 1e-5, f, &mut pc).unwrap();
+        let far = compute_face_point_class(&k, &b, Point3::new(0.25, 0.5, 3.0), 1e-5, f, &mut pc)
+            .unwrap();
         assert!(!far);
 
         // a face without surface
         let mut b2 = b.clone();
         b2.face_mut(f).unwrap().surface = None;
         let mut pc = PointClassification::new(1e-5);
-        assert!(compute_face_point_class(&k, &b2, Point3::new(0.0, 0.0, 0.0), 1e-5, f, &mut pc).is_err());
+        assert!(
+            compute_face_point_class(&k, &b2, Point3::new(0.0, 0.0, 0.0), 1e-5, f, &mut pc)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2659,7 +2672,15 @@ mod tests {
         let uvs = [Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0)];
         // an edge without curve (upstream dereferences it)
         assert!(matches!(
-            set_xsect_edge_through_point(&k, &mut b, e, Point3::new(0.0, 0.0, 0.0), &surfaces, &uvs, 0.0),
+            set_xsect_edge_through_point(
+                &k,
+                &mut b,
+                e,
+                Point3::new(0.0, 0.0, 0.0),
+                &surfaces,
+                &uvs,
+                0.0
+            ),
             Err(SolidError::InvalidInput { .. })
         ));
 
@@ -2671,15 +2692,30 @@ mod tests {
         ));
         let (mut b, e, _) = stand_in_brep(Some(line));
         // one surface: SM_ERR, nothing written
-        let r = set_xsect_edge_through_point(&k, &mut b, e, Point3::new(0.5, 0.0, 0.0), &surfaces[..1], &uvs[..1], 0.3)
-            .unwrap();
+        let r = set_xsect_edge_through_point(
+            &k,
+            &mut b,
+            e,
+            Point3::new(0.5, 0.0, 0.0),
+            &surfaces[..1],
+            &uvs[..1],
+            0.3,
+        )
+        .unwrap();
         assert!(!r.success && !r.modified_curve && r.deviation.is_none());
         assert_eq!(r.param, 0.3);
         // a point on the edge: projected, nothing to edit
-        let r = set_xsect_edge_through_point(&k, &mut b, e, Point3::new(0.5, 0.0, 0.0), &surfaces, &uvs, 0.3);
+        let r = set_xsect_edge_through_point(
+            &k,
+            &mut b,
+            e,
+            Point3::new(0.5, 0.0, 0.0),
+            &surfaces,
+            &uvs,
+            0.3,
+        );
         let r = r.unwrap();
         assert!(r.deviation.is_some());
         assert!(!r.modified_curve);
     }
-
 }
