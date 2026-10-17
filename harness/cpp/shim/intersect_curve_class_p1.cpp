@@ -21,6 +21,7 @@
 
 #include "StdAfx.h"
 #include <SmBSplineCurve.h>
+#include <SmBrep.h>
 #include <SmBSplineSurface.h>
 #include <SmCacheMgr.h>
 #include <SmCircle.h>
@@ -30,15 +31,18 @@
 #include <SmCurveCache.h>
 #include <SmCurveClass.h>
 #include <SmEdge.h>
+#include <SmEdgeuse.h>
 #include <SmEllipse.h>
 #include <SmExtent1d.h>
 #include <SmFace.h>
+#include <SmFaceuse.h>
 #include <SmGeomUtility.h>
 #include <SmGraphicsExtern.h>
 #include <SmGraphicsOutput.h>
 #include <SmHermiteCurve.h>
 #include <SmLine.h>
 #include <SmLoop.h>
+#include <SmLoopuse.h>
 #include <SmNurbsCrv.h>
 #include <SmNurbsSrf.h>
 #include <SmPlane.h>
@@ -1704,6 +1708,7 @@ enum : int64_t
     OP_EDGE_THROUGH = 48,
     OP_CCI_GEOMETRY = 49,
     OP_FACE_POINT_CLASS = 50,
+    OP_CCI_FACE = 51,
 };
 
 // Access to private / protected members through explicit instantiation.
@@ -2623,9 +2628,21 @@ int32_t run(Rd& rd, std::vector<double>& o)
                 return SC_ERR_ARG;
             if (src && srf[0] == NULL && edge_eval)
                 return SC_ERR_ARG;
-            // the edge path walks topology the stand-in edges do not have
-            if (edge != NULL)
+            // the edge path dereferences the curves of the edge and its mate
+            SmEdge* pe = (SmEdge*)edge;
+            SmEdge* pm = (SmEdge*)emate;
+            if (pe != NULL && (pe->GetCurve() == NULL || (pm != NULL && pm->GetCurve() == NULL)))
                 return SC_ERR_ARG;
+            // the port edits the classification curve and the edge curves as separate
+            // objects: one curve shared by two of them is not comparable
+            if (pe != NULL)
+            {
+                const SmCurve* cc_crv = src ? pcc->GetCurve() : NULL;
+                if (pe->GetCurve() == cc_crv)
+                    return SC_ERR_ARG;
+                if (pm != NULL && (pm->GetCurve() == cc_crv || pm->GetCurve() == pe->GetCurve()))
+                    return SC_ERR_ARG;
+            }
             SmBoolean flag = FALSE, mc = FALSE, me = FALSE, mm = FALSE;
             double dev = 0.0;
             SmStatus s = sc_cc_p1::sm_ApplyPointSolution(pcc, (SmEdge*)edge, (SmEdge*)emate, srf[0], &uvs[0], srf[1],
@@ -2642,6 +2659,12 @@ int32_t run(Rd& rd, std::vector<double>& o)
             o.push_back(sol.m_vStart[1]);
             if (src)
                 put_curve(o, pcc->GetCurve());
+            if (pe != NULL)
+            {
+                put_curve(o, pe->GetCurve());
+                if (pm != NULL)
+                    put_curve(o, pm->GetCurve());
+            }
             break;
         }
         case OP_ANGLE:
@@ -2827,6 +2850,58 @@ int32_t run(Rd& rd, std::vector<double>& o)
                 return SC_ERR_ARG;
             // the topology intersector stand-in is no SmTopologyIntersector
             if (cc.GetTopologyIntersector() != NULL)
+                return SC_ERR_ARG;
+            SmSolution sol;
+            SmEdge* mate = NULL;
+            SmTArray<const SmSurface*> srf;
+            SmTArray<SmEdgeuse*> eus;
+            SmTArray<const SmCurve*> uvc;
+            ULONG cnt = 0;
+            SmStatus s = sc_cc_p1::sm_GetCCIGeometry(&cc, sol, e, mate, srf, eus, uvc, cnt);
+            o.push_back(st(s));
+            o.push_back(pool.id(mate));
+            o.push_back((double)srf.GetSize());
+            o.push_back((double)cnt);
+            for (ULONG k = 0; k < srf.GetSize(); k++)
+            {
+                o.push_back(pool.id(srf[k]));
+                o.push_back(eus[k] == NULL ? -1.0 : -2.0);
+                o.push_back(pool.id(uvc[k]));
+            }
+            break;
+        }
+        case OP_CCI_FACE:
+        {
+            // sm_GetCCIGeometry on a boundary edge of a real face (SmBrep::CreateFaceFromSurface
+            // over the surface's natural UV domain): the face consumes pool surface `s`, so a
+            // script ends with this op; `side` picks the edge use of the face's loop.
+            int64_t si = rd.idx();
+            int64_t side = rd.idx();
+            SmSurface* sf = (SmSurface*)pool.get(si, {K_PLANE, K_BSURF}, ok);
+            if (!ok || sf == NULL || side < 0 || sf->GetOwner() != NULL)
+                return SC_ERR_ARG;
+            if (cc.GetTopologyIntersector() != NULL)
+                return SC_ERR_ARG;
+            const SmContext& ctx = *sf->GetContext();
+            SmBrep* brep = new (ctx) SmBrep();
+            SmFace* face = NULL;
+            if (brep->CreateFaceFromSurface(sf, sf->GetNaturalUVDomain(), face) != SM_SUCCESS || face == NULL ||
+                face->GetSurface() != sf)
+                return SC_ERR_ARG;
+            SmTArray<SmLoopuse*> loops;
+            face->GetUpwardFaceuse()->GetLoopuses(loops);
+            if (loops.GetSize() != 1)
+                return SC_ERR_ARG;
+            SmTArray<SmEdgeuse*> es;
+            loops[0]->GetEdgeuses(es);
+            if (es.GetSize() == 0)
+                return SC_ERR_ARG;
+            SmEdge* e = es[(ULONG)(side % (int64_t)es.GetSize())]->GetEdge();
+            SmTArray<SmFace*> faces;
+            e->GetFaces(faces);
+            // (the new face's edge uses carry no UV trim curve yet; the port's mirror has none)
+            if (faces.GetSize() != 1 || e->GetEdgeuseOfFace(face) == NULL ||
+                e->GetEdgeuseOfFace(face)->GetUVTrimCurve() != NULL)
                 return SC_ERR_ARG;
             SmSolution sol;
             SmEdge* mate = NULL;
